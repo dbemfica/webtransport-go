@@ -146,11 +146,23 @@ func TestCloseWithErrorTruncatesSendMessage(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 
-		typ, capsuleReader, err := http3.NewCapsuleParser(r.Body).Next()
-		if err != nil {
-			return
-		}
-		if typ == closeSessionCapsuleType {
+		// A session grants its peer an initial flow control allowance, so the
+		// close capsule is not necessarily the first one on the stream.
+		parser := http3.NewCapsuleParser(r.Body)
+
+		for {
+			typ, capsuleReader, err := parser.Next()
+			if err != nil {
+				return
+			}
+			if typ != closeSessionCapsuleType {
+				if _, err := io.Copy(io.Discard, capsuleReader); err != nil {
+					return
+				}
+
+				continue
+			}
+
 			var b [4]byte
 			if _, err := io.ReadFull(capsuleReader, b[:]); err != nil {
 				t.Errorf("failed to read error code: %v", err)
@@ -312,6 +324,8 @@ func TestSessionSendsQueuedCapsules(t *testing.T) {
 	require.NoError(t, serverStr.SetReadDeadline(time.Now().Add(time.Second)))
 
 	parser := http3.NewCapsuleParser(serverStr)
+	skipInitialAllowance(t, parser)
+
 	c, err := parseNextCapsule(parser)
 	require.NoError(t, err)
 	require.Equal(t, streamsBlockedBidiCapsule{MaximumStreams: 42}, c)
@@ -436,5 +450,17 @@ func TestCloseWithErrorDropsQueuedCapsulesWhenConnectStreamBlocked(t *testing.T)
 		require.NoError(t, err)
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+// skipInitialAllowance consumes the session flow control allowance that a
+// session with flow control disabled grants its peer as soon as it is
+// established.
+func skipInitialAllowance(t *testing.T, parser *http3.CapsuleParser) {
+	t.Helper()
+
+	for range 3 {
+		_, err := parseNextCapsule(parser)
+		require.NoError(t, err)
 	}
 }

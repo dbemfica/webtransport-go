@@ -10,6 +10,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // sessionID is the WebTransport Session ID
@@ -122,6 +123,51 @@ func newSession(
 		c.outgoingDataFC,
 		c.queueCapsule,
 	)
+
+	if !fc.Enabled {
+		// Grant the peer its session flow control allowance explicitly.
+		//
+		// Clients built on Apple's Network.framework -- Safari 26 and any
+		// Cocoa WebKit build -- do not consider a session's streams usable
+		// until this allowance arrives on the CONNECT stream. Without it,
+		// WebTransport.createBidirectionalStream() resolves but the stream
+		// carries nothing: the client reports WT_DATA_BLOCKED and
+		// WT_STREAMS_BLOCKED at zero, never writes a byte, and the session is
+		// torn down by whatever application-level timeout the server applies.
+		// Chromium opens and writes without waiting for the allowance, which
+		// is why the omission goes unnoticed against it.
+		//
+		// This is only sent when session flow control is disabled, which is
+		// also when no WT_INITIAL_MAX_* SETTINGS were advertised. A capsule
+		// must strictly increase the peer's limit, so sending one alongside
+		// those SETTINGS would restate a limit the peer already has, and the
+		// peer is entitled to reject that as a protocol violation.
+		for _, capsule := range []capsule{
+			maxDataCapsule{MaximumData: uint64(quicvarint.Max)},
+			maxStreamsBidiCapsule{MaximumStreams: fc.MaxIncomingStreams},
+			maxStreamsUniCapsule{MaximumStreams: fc.MaxIncomingUniStreams},
+		} {
+			// One capsule per write, because one write is one HTTP/3 DATA
+			// frame and the Network.framework client only acts on the first
+			// capsule of a frame. Packing all three into a single frame leaves
+			// it blocked on whichever two it ignored.
+			//
+			// The writes are non-blocking and failing them is not fatal. A
+			// blocking write would stall session setup whenever the CONNECT
+			// stream is flow control blocked, and queueing instead would leave
+			// bytes pending on the stream: WT_CLOSE_SESSION is written
+			// optimistically, with a non-blocking write of its own, so a
+			// session closed right after being established would find the
+			// buffer occupied and have to cancel the stream rather than tell
+			// the peer why. A failure here means the stream could not take a
+			// dozen bytes at the moment the session was created, which in
+			// practice means it is already gone -- and the session's own error
+			// handling owns that lifecycle.
+			if err := str.TryWriteAll(capsule.Append(nil)); err != nil {
+				break
+			}
+		}
+	}
 
 	go func() {
 		defer ctxCancel()
